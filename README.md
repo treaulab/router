@@ -202,6 +202,22 @@ active connections are dropped. If you quit while a switch is in progress, the
 interface waits for that switch to finish before exiting. Zero-downtime
 hot-swapping is the next step. Use `--no-interactive` to disable the interface.
 
+## Development
+
+The project uses [just](https://github.com/casey/just) for common tasks:
+
+```sh
+just            # list recipes
+just check      # gofmt check, go vet, go test
+just race       # go test -race
+just build      # static, stripped binary
+just run -b proton -c us/san-jose
+just ci         # full local CI: check, race, build
+```
+
+Without `just`, the equivalent commands are `go build .`, `go vet ./...`, and
+`go test ./...`.
+
 ## Flags
 
 ```
