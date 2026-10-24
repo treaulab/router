@@ -8,6 +8,17 @@ import (
 	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+var (
+	tuiTitleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("99"))
+	tuiHeadingStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("111"))
+	tuiCursorStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
+	tuiCurrentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	tuiErrorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	tuiMessageStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	tuiHintStyle    = lipgloss.NewStyle().Faint(true)
 )
 
 type tuiOption struct {
@@ -252,7 +263,7 @@ func (a *app) title() string {
 
 func (m *tuiModel) View() string {
 	var b strings.Builder
-	b.WriteString("  " + m.app.title() + "\n\n")
+	b.WriteString("  " + tuiTitleStyle.Render(m.app.title()) + "\n\n")
 	for _, line := range m.status {
 		b.WriteString("  " + line + "\n")
 	}
@@ -260,36 +271,37 @@ func (m *tuiModel) View() string {
 	if m.app.opts.backend == backendProton {
 		heading = "Select exit country or city"
 	}
-	b.WriteString("\n  " + heading + "\n")
+	b.WriteString("\n  " + tuiHeadingStyle.Render(heading) + "\n")
 	start, end := m.visibleRange()
 	for i := start; i < end; i++ {
 		option := m.options[i]
 		line := "  " + option.code + "  " + option.label
 		if i == m.cursor {
-			line = "> " + option.code + "  " + option.label
+			line = tuiCursorStyle.Render("> " + option.code + "  " + option.label)
 		}
 		if option.code == m.current {
-			line += "  (current)"
+			line += "  " + tuiCurrentStyle.Render("(current)")
 		}
 		b.WriteString(line + "\n")
 	}
 	if end < len(m.options) || start > 0 {
-		b.WriteString(fmt.Sprintf("  ... %d-%d of %d\n", start, end-1, len(m.options)))
+		b.WriteString(tuiHintStyle.Render(fmt.Sprintf("  ... %d-%d of %d", start, end-1, len(m.options))) + "\n")
 	}
 	b.WriteString("\n")
-	if m.switching {
-		b.WriteString("  " + m.message + "\n")
-	} else if m.err != "" {
-		b.WriteString("  " + m.err + "\n")
-	} else if m.message != "" {
-		b.WriteString("  " + m.message + "\n")
+	switch {
+	case m.switching:
+		b.WriteString("  " + tuiMessageStyle.Render(m.message) + "\n")
+	case m.err != "":
+		b.WriteString("  " + tuiErrorStyle.Render(m.err) + "\n")
+	case m.message != "":
+		b.WriteString("  " + tuiMessageStyle.Render(m.message) + "\n")
 	}
-	b.WriteString("\n  up/down or j/k move | enter select | r random | q quit\n")
+	b.WriteString("\n  " + tuiHintStyle.Render("up/down or j/k move | enter select | r random | q quit") + "\n")
 	if m.app.opts.backend == backendWarp {
-		b.WriteString("  de/fi/nl unavailable on WARP; use -b tor\n")
+		b.WriteString("  " + tuiHintStyle.Render("de/fi/nl unavailable on WARP; use -b tor") + "\n")
 	}
 	if m.app.opts.backend == backendProton {
-		b.WriteString("  free Proton WireGuard servers only\n")
+		b.WriteString("  " + tuiHintStyle.Render("free Proton WireGuard servers only") + "\n")
 	}
 	return b.String()
 }
