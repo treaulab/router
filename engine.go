@@ -1,8 +1,9 @@
 package main
 
 import (
-	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -24,23 +25,36 @@ const (
 	bootstrapTimeout = 60 * time.Second
 )
 
+var errInterrupted = errors.New("interrupted")
+
 type app struct {
-	opts        options
-	country     string
-	tun         bool
-	singBox     string
-	torBinary   string
-	geoip       string
-	geoip6      string
-	dir         string
-	configPath  string
-	logPath     string
-	torDataDir  string
-	realIP      string
-	engine      *engine
-	exitInfo    *exitInfo
-	stopped     []string
-	cleanupOnce sync.Once
+	opts              options
+	country           string
+	tun               bool
+	singBox           string
+	torBinary         string
+	geoip             string
+	geoip6            string
+	dir               string
+	configPath        string
+	logPath           string
+	torDataDir        string
+	warpAccount       *warpAccount
+	warpEndpoint      string
+	warpInner         *warpAccount
+	warpInnerEndpoint string
+	protonServers     []protonServer
+	protonServer      *protonServer
+	protonKey         string
+	protonAddress     string
+	protonDNS         string
+	protonMTU         int
+	realIP            string
+	engine            *engine
+	exitInfo          *exitInfo
+	stopped           []string
+	sigCh             chan os.Signal
+	cleanupOnce       sync.Once
 }
 
 type exitInfo struct {
@@ -62,33 +76,49 @@ type engine struct {
 }
 
 func run(opts options) error {
-	country, err := resolveCountry(opts.country)
-	if err != nil {
-		return err
-	}
 	a := &app{
-		opts:    opts,
-		country: country,
-		tun:     os.Geteuid() == 0 && !opts.proxyOnly,
+		opts:  opts,
+		tun:   os.Geteuid() == 0 && !opts.proxyOnly,
+		sigCh: make(chan os.Signal, 1),
 	}
+	// Proton choices need the free server list, which init loads. Other
+	// backends can validate before any network work or service changes.
+	if opts.backend != backendProton {
+		country, err := resolveCountryForBackend(opts.backend, opts.country)
+		if err != nil {
+			return err
+		}
+		a.country = country
+	}
+	signal.Notify(a.sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(a.sigCh)
+
 	if err := a.init(); err != nil {
 		return err
 	}
 	defer a.cleanup()
 
+	if opts.backend == backendProton {
+		country, err := resolveProtonChoice(opts.country, a.protonServers)
+		if err != nil {
+			return err
+		}
+		a.country = country
+	}
+
 	if err := a.start(); err != nil {
+		if errors.Is(err, errInterrupted) {
+			fmt.Fprintln(stdout, "\nDisconnecting...")
+			return nil
+		}
 		a.printLogTail(30)
 		return err
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
 	if !opts.noInteractive && isTerminal(os.Stdin) {
-		return a.interactive(sigCh)
+		return a.interactive(a.sigCh)
 	}
-	return a.wait(sigCh)
+	return a.wait(a.sigCh)
 }
 
 func (a *app) init() error {
@@ -97,31 +127,61 @@ func (a *app) init() error {
 	if err != nil {
 		return err
 	}
-	a.torBinary, err = findTorBinary()
-	if err != nil {
-		return err
-	}
-	a.geoip, a.geoip6 = findGeoIP()
-	if a.geoip == "" {
-		fmt.Fprintln(os.Stderr, "warning: Tor GeoIP database not found; country exits may fail")
-	}
 
 	a.dir = filepath.Join(os.TempDir(), "router-"+strconv.Itoa(os.Geteuid()))
-	a.configPath = filepath.Join(a.dir, "sing-box-tor.json")
 	a.logPath = filepath.Join(a.dir, "sing-box.log")
-	a.torDataDir = filepath.Join(a.dir, "tor")
 
-	if a.opts.clean {
-		fmt.Println("Clearing cached Tor data...")
-		if err := os.RemoveAll(a.torDataDir); err != nil {
-			return fmt.Errorf("clear Tor data: %w", err)
+	switch a.opts.backend {
+	case backendWarp:
+		a.configPath = filepath.Join(a.dir, "sing-box-warp.json")
+		if err := os.MkdirAll(a.dir, 0o700); err != nil {
+			return fmt.Errorf("create state directory: %w", err)
 		}
-	}
-	if err := os.MkdirAll(a.dir, 0o700); err != nil {
-		return fmt.Errorf("create state directory: %w", err)
-	}
-	if err := os.MkdirAll(a.torDataDir, 0o700); err != nil {
-		return fmt.Errorf("create Tor data directory: %w", err)
+		a.warpAccount, err = loadOrRegisterWarp(context.Background(), warpAccountPath())
+		if err != nil {
+			return fmt.Errorf("initialize WARP: %w", err)
+		}
+	case backendProton:
+		a.configPath = filepath.Join(a.dir, "sing-box-proton.json")
+		if err := os.MkdirAll(a.dir, 0o700); err != nil {
+			return fmt.Errorf("create state directory: %w", err)
+		}
+		a.protonKey, err = protonPrivateKey()
+		if err != nil {
+			return err
+		}
+		a.protonAddress, a.protonDNS, a.protonMTU, err = protonConfigSettings()
+		if err != nil {
+			return err
+		}
+		a.protonServers, err = loadProtonServers(context.Background())
+		if err != nil {
+			return fmt.Errorf("load Proton servers: %w", err)
+		}
+	default:
+		a.configPath = filepath.Join(a.dir, "sing-box-tor.json")
+		a.torDataDir = filepath.Join(a.dir, "tor")
+		a.torBinary, err = findTorBinary()
+		if err != nil {
+			return err
+		}
+		a.geoip, a.geoip6 = findGeoIP()
+		if a.geoip == "" {
+			fmt.Fprintln(stderr, "warning: Tor GeoIP database not found; country exits may fail")
+		}
+
+		if a.opts.clean {
+			fmt.Fprintln(stdout, "Clearing cached Tor data...")
+			if err := os.RemoveAll(a.torDataDir); err != nil {
+				return fmt.Errorf("clear Tor data: %w", err)
+			}
+		}
+		if err := os.MkdirAll(a.dir, 0o700); err != nil {
+			return fmt.Errorf("create state directory: %w", err)
+		}
+		if err := os.MkdirAll(a.torDataDir, 0o700); err != nil {
+			return fmt.Errorf("create Tor data directory: %w", err)
+		}
 	}
 
 	if a.tun {
@@ -139,7 +199,9 @@ func (a *app) start() error {
 	if a.tun && interfaceExists(a.opts.interfaceName) {
 		return fmt.Errorf("interface %s already exists; remove it or use --interface", a.opts.interfaceName)
 	}
-	config := buildConfig(configOptions{
+
+	configOpts := configOptions{
+		Backend:       a.opts.backend,
 		Country:       a.country,
 		ListenPort:    a.opts.listenPort,
 		TUN:           a.tun,
@@ -149,7 +211,53 @@ func (a *app) start() error {
 		GeoIP:         a.geoip,
 		GeoIP6:        a.geoip6,
 		LogPath:       a.logPath,
-	})
+	}
+	switch a.opts.backend {
+	case backendWarp:
+		outerEndpoint, err := warpPeerEndpoint("any", a.warpAccount)
+		if err != nil {
+			return err
+		}
+		a.warpEndpoint = outerEndpoint
+		configOpts.WarpAccount = a.warpAccount
+		configOpts.WarpEndpoint = outerEndpoint
+
+		if a.country == "us" {
+			if a.warpInner == nil {
+				inner, err := loadOrRegisterWarpInner(context.Background())
+				if err != nil {
+					return fmt.Errorf("initialize inner WARP: %w", err)
+				}
+				a.warpInner = inner
+			}
+			innerEndpoint, err := warpPeerEndpoint("us", a.warpInner)
+			if err != nil {
+				return err
+			}
+			a.warpInnerEndpoint = innerEndpoint
+			configOpts.WarpInner = a.warpInner
+			configOpts.WarpInnerEndpoint = innerEndpoint
+		} else {
+			a.warpInnerEndpoint = ""
+		}
+	case backendProton:
+		server, err := selectProtonServer(a.protonServers, a.country)
+		if err != nil {
+			return err
+		}
+		endpoint, err := server.endpoint()
+		if err != nil {
+			return err
+		}
+		a.protonServer = &server
+		configOpts.ProtonPrivateKey = a.protonKey
+		configOpts.ProtonServer = &server
+		configOpts.ProtonEndpoint = endpoint
+		configOpts.ProtonAddress = a.protonAddress
+		configOpts.ProtonDNS = a.protonDNS
+		configOpts.ProtonMTU = a.protonMTU
+	}
+	config := buildConfig(configOpts)
 	if err := writeConfig(a.configPath, config); err != nil {
 		return err
 	}
@@ -158,7 +266,7 @@ func (a *app) start() error {
 	if a.tun {
 		mode = "TUN (whole system)"
 	}
-	fmt.Printf("Starting sing-box Tor engine (%s, %s)...\n", mode, countryName(a.country))
+	fmt.Fprintf(stdout, "Starting sing-box %s engine (%s, %s)...\n", backendName(a.opts.backend), mode, a.countryLabel(a.country))
 
 	e, err := startEngine(a.singBox, a.configPath, a.logPath)
 	if err != nil {
@@ -172,16 +280,16 @@ func (a *app) start() error {
 	}
 
 	if !a.opts.noVerify {
-		info, err := waitForExit(a.opts.listenPort, a.realIP, bootstrapTimeout, e)
+		info, err := a.waitForExit(a.opts.listenPort, a.realIP, bootstrapTimeout, e)
 		if err != nil {
 			e.stop()
 			return err
 		}
 		a.exitInfo = info
 		if a.tun {
-			if tunInfo, err := fetchExitDirect(); err == nil && tunInfo.IP != "" {
+			if tunInfo, err := fetchExitDirect(a.opts.backend); err == nil && tunInfo.IP != "" {
 				if a.realIP != "" && tunInfo.IP == a.realIP {
-					fmt.Fprintf(os.Stderr, "warning: system traffic appears to use the real IP (%s), not Tor\n", a.realIP)
+					fmt.Fprintf(stderr, "warning: system traffic appears to use the real IP (%s), not %s\n", a.realIP, backendName(a.opts.backend))
 				} else {
 					a.exitInfo = tunInfo
 				}
@@ -195,6 +303,11 @@ func (a *app) start() error {
 func (a *app) waitForReady() error {
 	deadline := time.Now().Add(startupTimeout)
 	for time.Now().Before(deadline) {
+		select {
+		case <-a.sigCh:
+			return errInterrupted
+		default:
+		}
 		if err, exited := a.engine.status(); exited {
 			if err == nil {
 				err = fmt.Errorf("sing-box exited during startup")
@@ -217,7 +330,7 @@ func (a *app) wait(sigCh <-chan os.Signal) error {
 	for {
 		select {
 		case <-sigCh:
-			fmt.Println("\nDisconnecting...")
+			fmt.Fprintln(stdout, "\nDisconnecting...")
 			return nil
 		case <-time.After(time.Second):
 			if err, exited := a.engine.status(); exited {
@@ -231,130 +344,114 @@ func (a *app) wait(sigCh <-chan os.Signal) error {
 	}
 }
 
-func (a *app) interactive(sigCh <-chan os.Signal) error {
-	lines := make(chan string)
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			lines <- scanner.Text()
-		}
-		close(lines)
-	}()
-
-	fmt.Println()
-	fmt.Println("Switch: <code>, n(ext), r(andom), l(ist), s(tatus), q(uit)")
-	for {
-		fmt.Printf("[%s] > ", a.country)
-		select {
-		case <-sigCh:
-			fmt.Println("\nDisconnecting...")
-			return nil
-		case line, ok := <-lines:
-			if !ok {
-				fmt.Println("\nDisconnecting...")
-				return nil
-			}
-			command := strings.ToLower(strings.TrimSpace(line))
-			switch command {
-			case "":
-				continue
-			case "q", "quit", "exit":
-				fmt.Println("Disconnecting...")
-				return nil
-			case "l", "list":
-				printCountryList()
-			case "s", "status":
-				a.printStatus()
-			case "n", "next":
-				if err := a.switchCountry(nextCountry(a.country)); err != nil {
-					fmt.Fprintln(os.Stderr, "switch failed:", err)
-				}
-			case "r", "random":
-				if err := a.switchCountry(randomCountry()); err != nil {
-					fmt.Fprintln(os.Stderr, "switch failed:", err)
-				}
-			default:
-				code, err := parseCountryChoice(command)
-				if err != nil {
-					fmt.Fprintln(os.Stderr, err)
-					continue
-				}
-				if err := a.switchCountry(code); err != nil {
-					fmt.Fprintln(os.Stderr, "switch failed:", err)
-				}
-			}
-		case <-time.After(time.Second):
-			if err, exited := a.engine.status(); exited {
-				a.printLogTail(30)
-				if err == nil {
-					err = fmt.Errorf("sing-box exited")
-				}
-				return err
-			}
-		}
-	}
-}
-
-func parseCountryChoice(value string) (string, error) {
+func parseCountryChoice(backend, value string) (string, error) {
+	codes := countryCodes(backend)
 	if n, err := strconv.Atoi(value); err == nil {
 		if n == 0 {
 			return "any", nil
 		}
-		if n >= 1 && n <= len(commonCountries) {
-			return commonCountries[n-1].Code, nil
+		if n >= 1 && n <= len(codes) {
+			return codes[n-1], nil
 		}
-		return "", fmt.Errorf("number out of range (0 = any, 1-%d = country)", len(commonCountries))
+		return "", fmt.Errorf("number out of range (0 = any, 1-%d = country)", len(codes))
 	}
-	return resolveCountry(value)
+	return resolveCountryForBackend(backend, value)
+}
+
+func (a *app) resolveCountry(value string) (string, error) {
+	if a.opts.backend == backendProton {
+		return resolveProtonChoice(value, a.protonServers)
+	}
+	return resolveCountryForBackend(a.opts.backend, value)
 }
 
 func (a *app) switchCountry(country string) error {
-	country, err := resolveCountry(country)
+	country, err := a.resolveCountry(country)
 	if err != nil || country == a.country {
 		return err
 	}
 
-	fmt.Printf("Switching %s -> %s (restarting engine)...\n", countryName(a.country), countryName(country))
+	fmt.Fprintf(stdout, "Switching %s -> %s (restarting engine)...\n", a.countryLabel(a.country), a.countryLabel(country))
 	oldCountry := a.country
 	a.engine.stop()
 	waitForShutdown(a.opts.interfaceName, a.opts.listenPort, a.tun, 10*time.Second)
 
 	a.country = country
 	if err := a.start(); err != nil {
-		fmt.Fprintf(os.Stderr, "could not start %s, restoring %s: %v\n", countryName(country), countryName(oldCountry), err)
+		if errors.Is(err, errInterrupted) {
+			return err
+		}
+		fmt.Fprintf(stderr, "could not start %s, restoring %s: %v\n", a.countryLabel(country), a.countryLabel(oldCountry), err)
 		a.country = oldCountry
 		if restoreErr := a.start(); restoreErr != nil {
 			return fmt.Errorf("switch failed and restore failed: %v (restore: %v)", err, restoreErr)
 		}
-		return fmt.Errorf("switch to %s failed: %w", countryName(country), err)
+		return fmt.Errorf("switch to %s failed: %w", a.countryLabel(country), err)
 	}
 	return nil
 }
 
-func (a *app) printStatus() {
-	fmt.Println()
-	fmt.Println("=== Tor Router ===")
+func (a *app) countryLabel(code string) string {
+	return countryLabel(a.opts.backend, code, a.protonServers)
+}
+
+func (a *app) statusLines() []string {
+	var lines []string
 	if a.tun {
-		fmt.Println("Mode:      TUN (whole system)")
-		fmt.Println("Interface:", a.opts.interfaceName)
+		lines = append(lines, "Mode:      TUN (whole system)")
+		lines = append(lines, "Interface: "+a.opts.interfaceName)
 	} else {
-		fmt.Println("Mode:      Mixed proxy")
+		lines = append(lines, "Mode:      Mixed proxy")
 	}
-	fmt.Printf("Proxy:     http://127.0.0.1:%d  socks5://127.0.0.1:%d\n", a.opts.listenPort, a.opts.listenPort)
-	fmt.Printf("Country:   %s (%s)\n", countryName(a.country), a.country)
+	lines = append(lines, fmt.Sprintf("Proxy:     http://127.0.0.1:%d  socks5://127.0.0.1:%d", a.opts.listenPort, a.opts.listenPort))
+	if a.opts.backend == backendProton {
+		lines = append(lines, "Country:   "+a.countryLabel(a.country))
+	} else {
+		lines = append(lines, fmt.Sprintf("Country:   %s (%s)", a.countryLabel(a.country), a.country))
+	}
+	if a.opts.backend == backendWarp && a.warpEndpoint != "" {
+		if a.warpInnerEndpoint != "" {
+			lines = append(lines, "Outer:     "+a.warpEndpoint)
+			lines = append(lines, "Inner:     "+a.warpInnerEndpoint+" (Double WARP)")
+		} else {
+			lines = append(lines, "Endpoint:  "+a.warpEndpoint)
+		}
+	}
+	if a.opts.backend == backendProton && a.protonServer != nil {
+		lines = append(lines, "Server:    "+a.protonServer.ServerName)
+		if endpoint, err := a.protonServer.endpoint(); err == nil {
+			lines = append(lines, fmt.Sprintf("Endpoint:  %s:%d", endpoint, protonEndpointPort))
+		}
+	}
 	if a.exitInfo != nil {
 		location := strings.Trim(strings.Join([]string{a.exitInfo.City, a.exitInfo.Country}, ", "), ", ")
 		if location != "" {
-			fmt.Println("Exit:     ", location)
+			lines = append(lines, "Exit:      "+location)
 		}
 		if a.exitInfo.IP != "" {
-			fmt.Println("Exit IP:  ", a.exitInfo.IP)
+			lines = append(lines, "Exit IP:   "+a.exitInfo.IP)
 		}
 		if a.exitInfo.ISP != "" {
-			fmt.Println("ISP:      ", a.exitInfo.ISP)
+			lines = append(lines, "ISP:       "+a.exitInfo.ISP)
 		}
 	}
-	fmt.Println()
+	return lines
+}
+
+func (a *app) printStatus() {
+	fmt.Fprintln(stdout)
+	switch a.opts.backend {
+	case backendWarp:
+		fmt.Fprintln(stdout, "=== WARP Router ===")
+	case backendProton:
+		fmt.Fprintln(stdout, "=== Proton VPN Router ===")
+	default:
+		fmt.Fprintln(stdout, "=== Tor Router ===")
+	}
+	for _, line := range a.statusLines() {
+		fmt.Fprintln(stdout, line)
+	}
+	fmt.Fprintln(stdout)
 }
 
 func (a *app) printLogTail(n int) {
@@ -369,9 +466,9 @@ func (a *app) printLogTail(n int) {
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}
-	fmt.Fprintln(os.Stderr, "--- sing-box log tail ---")
+	fmt.Fprintln(stderr, "--- sing-box log tail ---")
 	for _, line := range lines {
-		fmt.Fprintln(os.Stderr, " ", stripANSI(line))
+		fmt.Fprintln(stderr, " ", stripANSI(line))
 	}
 }
 
@@ -402,7 +499,7 @@ func (a *app) cleanup() {
 			waitForShutdown(a.opts.interfaceName, a.opts.listenPort, a.tun, 5*time.Second)
 		}
 		for i := len(a.stopped) - 1; i >= 0; i-- {
-			fmt.Println("Restarting service:", a.stopped[i])
+			fmt.Fprintln(stdout, "Restarting service:", a.stopped[i])
 			_ = exec.Command("systemctl", "start", a.stopped[i]).Run()
 		}
 	})
@@ -482,7 +579,7 @@ func stopConflictingServices() []string {
 	var stopped []string
 	for _, svc := range []string{"sing-box", "zapret"} {
 		if err := exec.Command("systemctl", "is-active", "--quiet", svc).Run(); err == nil {
-			fmt.Println("Stopping conflicting service:", svc)
+			fmt.Fprintln(stdout, "Stopping conflicting service:", svc)
 			if err := exec.Command("systemctl", "stop", svc).Run(); err == nil {
 				stopped = append(stopped, svc)
 			}
@@ -548,24 +645,40 @@ func detectRealIP() string {
 	if info, err := fetchIPAPI(directClient(5 * time.Second)); err == nil {
 		return info.IP
 	}
-	if info, err := fetchTrace(directClient(5 * time.Second)); err == nil {
+	if info, err := fetchTrace(directClient(5*time.Second), ""); err == nil {
 		return info.IP
 	}
 	return ""
 }
 
-func fetchExitDirect() (*exitInfo, error) {
-	info, err := fetchTrace(directClient(8 * time.Second))
+func fetchExitDirect(backend string) (*exitInfo, error) {
+	info, err := fetchTrace(directClient(8*time.Second), traceISP(backend))
 	if err == nil {
 		return info, nil
 	}
 	return fetchIPAPI(directClient(8 * time.Second))
 }
 
-func waitForExit(port int, realIP string, timeout time.Duration, e *engine) (*exitInfo, error) {
+func traceISP(backend string) string {
+	switch backend {
+	case backendTor:
+		return "Tor Network"
+	case backendProton:
+		return "Proton VPN"
+	default:
+		return ""
+	}
+}
+
+func (a *app) waitForExit(port int, realIP string, timeout time.Duration, e *engine) (*exitInfo, error) {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
+		select {
+		case <-a.sigCh:
+			return nil, errInterrupted
+		default:
+		}
 		if err, exited := e.status(); exited {
 			if err == nil {
 				err = fmt.Errorf("sing-box exited")
@@ -575,7 +688,7 @@ func waitForExit(port int, realIP string, timeout time.Duration, e *engine) (*ex
 		client := proxyClient(port, 8*time.Second)
 		info, err := fetchIPAPI(client)
 		if err != nil {
-			info, err = fetchTrace(client)
+			info, err = fetchTrace(client, traceISP(a.opts.backend))
 		}
 		if err == nil && info.IP != "" {
 			if realIP == "" || info.IP != realIP {
@@ -588,9 +701,9 @@ func waitForExit(port int, realIP string, timeout time.Duration, e *engine) (*ex
 		time.Sleep(1500 * time.Millisecond)
 	}
 	if lastErr != nil {
-		return nil, fmt.Errorf("Tor did not become ready: %w", lastErr)
+		return nil, fmt.Errorf("%s did not become ready: %w", backendName(a.opts.backend), lastErr)
 	}
-	return nil, fmt.Errorf("Tor did not become ready within %s", timeout)
+	return nil, fmt.Errorf("%s did not become ready within %s", backendName(a.opts.backend), timeout)
 }
 
 func fetchIPAPI(client *http.Client) (*exitInfo, error) {
@@ -618,7 +731,7 @@ func fetchIPAPI(client *http.Client) (*exitInfo, error) {
 	}, nil
 }
 
-func fetchTrace(client *http.Client) (*exitInfo, error) {
+func fetchTrace(client *http.Client, defaultISP string) (*exitInfo, error) {
 	resp, err := client.Get("https://1.1.1.1/cdn-cgi/trace")
 	if err != nil {
 		return nil, err
@@ -641,11 +754,15 @@ func fetchTrace(client *http.Client) (*exitInfo, error) {
 	if values["ip"] == "" {
 		return nil, fmt.Errorf("trace did not return an address")
 	}
+	isp := "Tor Network"
+	if values["warp"] == "on" {
+		isp = "Cloudflare WARP"
+	}
 	return &exitInfo{
 		IP:          values["ip"],
 		Country:     values["loc"],
 		CountryCode: values["loc"],
 		City:        values["colo"],
-		ISP:         "Tor Network",
+		ISP:         isp,
 	}, nil
 }

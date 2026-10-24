@@ -9,6 +9,19 @@
 coverage.out
 coverage.html
 
+# Repomix output
+repomix-output.*
+repomix-output-*
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Local WARP credentials
+warp_account.json
+warp_inner_account.json
+
 # Go workspace files
 go.work
 go.work.sum
