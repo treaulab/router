@@ -1,5 +1,6 @@
 # Binaries
 /bin/
+/router
 *.exe
 *.test
 *.out
