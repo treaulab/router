@@ -67,7 +67,7 @@ func newTUIModel(a *app) *tuiModel {
 }
 
 func (a *app) tuiOptions() []tuiOption {
-	if a.opts.backend == backendProton {
+	if isProtonBackend(a.opts.backend) {
 		choices := protonTUIChoices(a.protonServers)
 		options := make([]tuiOption, 0, len(choices))
 		for _, choice := range choices {
@@ -160,7 +160,7 @@ func (m *tuiModel) requestQuit() (tea.Model, tea.Cmd) {
 
 func (a *app) choiceLabel(code string) string {
 	if code == "random" {
-		if a.opts.backend == backendProton {
+		if isProtonBackend(a.opts.backend) {
 			return "a random city"
 		}
 		return "a random country"
@@ -256,6 +256,8 @@ func (a *app) title() string {
 		return "WARP Router"
 	case backendProton:
 		return "Proton VPN Router"
+	case backendProtonWarp:
+		return "Proton -> WARP Router"
 	default:
 		return "Tor Router"
 	}
@@ -268,7 +270,7 @@ func (m *tuiModel) View() string {
 		b.WriteString("  " + line + "\n")
 	}
 	heading := "Select exit country"
-	if m.app.opts.backend == backendProton {
+	if isProtonBackend(m.app.opts.backend) {
 		heading = "Select exit country or city"
 	}
 	b.WriteString("\n  " + tuiHeadingStyle.Render(heading) + "\n")
@@ -300,8 +302,11 @@ func (m *tuiModel) View() string {
 	if m.app.opts.backend == backendWarp {
 		b.WriteString("  " + tuiHintStyle.Render("de/fi/nl unavailable on WARP; use -b tor") + "\n")
 	}
-	if m.app.opts.backend == backendProton {
+	if isProtonBackend(m.app.opts.backend) {
 		b.WriteString("  " + tuiHintStyle.Render("free Proton WireGuard servers only") + "\n")
+	}
+	if m.app.opts.backend == backendProtonWarp {
+		b.WriteString("  " + tuiHintStyle.Render("Proton outer -> Cloudflare WARP inner") + "\n")
 	}
 	return b.String()
 }

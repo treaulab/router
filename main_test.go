@@ -127,6 +127,60 @@ func TestBuildWarpConfigTUN(t *testing.T) {
 	}
 }
 
+func TestBuildProtonWarpConfig(t *testing.T) {
+	servers := testProtonServers(t)
+	server, err := selectProtonServer(servers, "us/san-jose")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := &warpAccount{
+		PrivateKey:    "CG525hUWlBjiFT3ae10/ExXT3k+KXFHidf5FFx99K1I=",
+		PeerPublicKey: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+		V4Address:     "172.16.0.2",
+		V6Address:     "2606:4700:110:8623:a9df:c1c8:25e8:3b9c",
+	}
+	config := buildConfig(configOptions{
+		Backend:           backendProtonWarp,
+		Country:           "us/san-jose",
+		ListenPort:        10813,
+		TUN:               true,
+		InterfaceName:     "sb-proton-warp",
+		ProtonPrivateKey:  testProtonKey,
+		ProtonServer:      &server,
+		ProtonEndpoint:    "1.2.3.4",
+		ProtonAddress:     "10.2.0.2/32",
+		ProtonDNS:         "10.2.0.1",
+		ProtonMTU:         1420,
+		WarpInner:         account,
+		WarpInnerEndpoint: "162.159.192.1",
+	})
+
+	if len(config.Endpoints) != 2 {
+		t.Fatalf("endpoints = %d, want 2", len(config.Endpoints))
+	}
+	proton := config.Endpoints[0]
+	if proton.Tag != "proton-out" || proton.Detour != "" || proton.MTU != 1420 {
+		t.Fatalf("unexpected Proton endpoint: %+v", proton)
+	}
+	if len(proton.Peers) != 1 || proton.Peers[0].Address != "1.2.3.4" || proton.Peers[0].Port != protonEndpointPort {
+		t.Fatalf("unexpected Proton peer: %+v", proton.Peers)
+	}
+	warp := config.Endpoints[1]
+	if warp.Tag != "warp-inner" || warp.Detour != "proton-out" || warp.MTU != warpInnerMTU {
+		t.Fatalf("unexpected WARP endpoint: %+v", warp)
+	}
+	if len(warp.Peers) != 1 || warp.Peers[0].Address != "162.159.192.1" || warp.Peers[0].Port != warpEndpointPort {
+		t.Fatalf("unexpected WARP peer: %+v", warp.Peers)
+	}
+	if config.DNS.Servers[0].Server != "1.1.1.1" {
+		t.Fatalf("unexpected DNS: %+v", config.DNS.Servers)
+	}
+	last := config.Route.Rules[len(config.Route.Rules)-1]
+	if last.Outbound != "warp-inner" {
+		t.Fatalf("last route rule = %+v, want warp-inner", last)
+	}
+}
+
 func TestBuildWarpConfigProxyOnly(t *testing.T) {
 	account := &warpAccount{
 		PrivateKey:    "CG525hUWlBjiFT3ae10/ExXT3k+KXFHidf5FFx99K1I=",
@@ -410,6 +464,14 @@ func TestParseFlagsBackend(t *testing.T) {
 	}
 	if opts.backend != backendProton || opts.interfaceName != defaultProtonInterface || opts.country != "us/san-jose" {
 		t.Fatalf("unexpected Proton options: %+v", opts)
+	}
+
+	opts, err = parseFlags([]string{"-b", "proton-warp", "-c", "ch/zurich"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.backend != backendProtonWarp || opts.interfaceName != defaultProtonWarpInterface || opts.country != "ch/zurich" {
+		t.Fatalf("unexpected Proton-WARP options: %+v", opts)
 	}
 
 	if _, err := parseFlags([]string{"-b", "nope"}); err == nil {

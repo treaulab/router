@@ -8,10 +8,15 @@ import (
 )
 
 const (
-	backendTor    = "tor"
-	backendWarp   = "warp"
-	backendProton = "proton"
+	backendTor        = "tor"
+	backendWarp       = "warp"
+	backendProton     = "proton"
+	backendProtonWarp = "proton-warp"
 )
+
+func isProtonBackend(backend string) bool {
+	return backend == backendProton || backend == backendProtonWarp
+}
 
 type country struct {
 	Code string
@@ -60,8 +65,10 @@ func validateBackend(value string) (string, error) {
 		return backendTor, nil
 	case backendProton:
 		return backendProton, nil
+	case backendProtonWarp:
+		return backendProtonWarp, nil
 	default:
-		return "", fmt.Errorf("invalid backend %q (use warp, proton, or tor)", value)
+		return "", fmt.Errorf("invalid backend %q (use warp, proton, proton-warp, or tor)", value)
 	}
 }
 
@@ -71,6 +78,8 @@ func backendName(backend string) string {
 		return "WARP"
 	case backendProton:
 		return "Proton VPN"
+	case backendProtonWarp:
+		return "Proton -> WARP"
 	default:
 		return "Tor"
 	}
@@ -89,7 +98,7 @@ func countryName(code string) string {
 }
 
 func countryLabel(backend, code string, servers []protonServer) string {
-	if backend == backendProton {
+	if isProtonBackend(backend) {
 		return protonChoiceLabel(code, servers)
 	}
 	if code == "any" {
@@ -130,7 +139,7 @@ func resolveCountry(value string) (string, error) {
 }
 
 func resolveCountryForBackend(backend, value string) (string, error) {
-	if backend == backendProton {
+	if isProtonBackend(backend) {
 		return "", fmt.Errorf("Proton locations require the free server list")
 	}
 	value = strings.ToLower(strings.TrimSpace(value))
@@ -185,7 +194,7 @@ func countryCodes(backend string) []string {
 	if backend == backendWarp {
 		return warpCountryCodes
 	}
-	if backend == backendProton {
+	if isProtonBackend(backend) {
 		return nil
 	}
 	codes := make([]string, len(commonCountries))
@@ -196,7 +205,7 @@ func countryCodes(backend string) []string {
 }
 
 func printCountryList(backend string, servers []protonServer) {
-	if backend == backendProton {
+	if isProtonBackend(backend) {
 		for i, choice := range protonLocationChoices(servers) {
 			fmt.Fprintf(stdout, "%2d  %-14s %s\n", i, choice.Code, choice.Label)
 		}
@@ -204,6 +213,10 @@ func printCountryList(backend string, servers []protonServer) {
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, "Only free Proton WireGuard servers are listed.")
 		fmt.Fprintln(stdout, "Pick a city with -c cc/city, e.g. -c us/san-jose.")
+		if backend == backendProtonWarp {
+			fmt.Fprintln(stdout, "Traffic path: Proton city (outer) -> WARP (inner).")
+			fmt.Fprintln(stdout, "The final internet exit is Cloudflare WARP, not Proton.")
+		}
 		return
 	}
 

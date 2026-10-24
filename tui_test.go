@@ -317,4 +317,17 @@ func TestTUIView(t *testing.T) {
 			t.Errorf("Proton view does not contain %q:\n%s", want, protonView)
 		}
 	}
+
+	protonWarpView := newTUIModel(testTUIApp(backendProtonWarp, "us/san-jose", testProtonServers(t)...)).View()
+	for _, want := range []string{
+		"Proton -> WARP Router",
+		"Select exit country or city",
+		"us/san-jose",
+		"free Proton WireGuard servers only",
+		"Proton outer -> Cloudflare WARP inner",
+	} {
+		if !strings.Contains(protonWarpView, want) {
+			t.Errorf("Proton-WARP view does not contain %q:\n%s", want, protonWarpView)
+		}
+	}
 }

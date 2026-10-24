@@ -9,10 +9,11 @@ import (
 )
 
 const (
-	defaultListenPort      = 10808
-	defaultTorInterface    = "sb-tor"
-	defaultWarpInterface   = "sb-warp"
-	defaultProtonInterface = "sb-proton"
+	defaultListenPort          = 10808
+	defaultTorInterface        = "sb-tor"
+	defaultWarpInterface       = "sb-warp"
+	defaultProtonInterface     = "sb-proton"
+	defaultProtonWarpInterface = "sb-proton-warp"
 )
 
 type options struct {
@@ -38,7 +39,7 @@ func main() {
 	}
 	if opts.list {
 		var servers []protonServer
-		if opts.backend == backendProton {
+		if isProtonBackend(opts.backend) {
 			var err error
 			servers, err = loadProtonServers(context.Background())
 			if err != nil {
@@ -58,8 +59,8 @@ func main() {
 func parseFlags(args []string) (options, error) {
 	var opts options
 	fs := flag.NewFlagSet("router", flag.ContinueOnError)
-	fs.StringVar(&opts.backend, "b", backendWarp, "backend: warp, proton, or tor")
-	fs.StringVar(&opts.backend, "backend", backendWarp, "backend: warp, proton, or tor")
+	fs.StringVar(&opts.backend, "b", backendWarp, "backend: warp, proton, proton-warp, or tor")
+	fs.StringVar(&opts.backend, "backend", backendWarp, "backend: warp, proton, proton-warp, or tor")
 	fs.StringVar(&opts.country, "c", "any", "exit country or city: two-letter code, cc/city (Proton), any, or random")
 	fs.StringVar(&opts.country, "country", "any", "exit country or city: two-letter code, cc/city (Proton), any, or random")
 	fs.IntVar(&opts.listenPort, "listen-port", defaultListenPort, "local mixed proxy port")
@@ -68,7 +69,7 @@ func parseFlags(args []string) (options, error) {
 	fs.BoolVar(&opts.list, "list", false, "list countries and exit")
 	fs.BoolVar(&opts.noVerify, "no-verify", false, "skip exit verification")
 	fs.BoolVar(&opts.noInteractive, "no-interactive", false, "disable the interactive country switcher")
-	fs.StringVar(&opts.interfaceName, "interface", "", "TUN interface name (default: sb-warp, sb-proton, or sb-tor)")
+	fs.StringVar(&opts.interfaceName, "interface", "", "TUN interface name (default: sb-warp, sb-proton, sb-proton-warp, or sb-tor)")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), `router - Cloudflare WARP, Proton VPN, and Tor router powered by sing-box
 
@@ -79,6 +80,7 @@ Examples:
   sudo router                            # WARP, automatic Cloudflare edge
   sudo router -c us                      # WARP, US Double WARP
   sudo router -b proton -c us/san-jose   # free Proton WireGuard, San Jose
+  sudo router -b proton-warp -c ch/zurich # Proton Zurich outer, WARP inner
   sudo router -b tor -c jp               # Tor
   router --proxy-only -c any             # local proxy instead of TUN
 
@@ -115,6 +117,8 @@ Flags:
 			opts.interfaceName = defaultWarpInterface
 		case backendProton:
 			opts.interfaceName = defaultProtonInterface
+		case backendProtonWarp:
+			opts.interfaceName = defaultProtonWarpInterface
 		default:
 			opts.interfaceName = defaultTorInterface
 		}

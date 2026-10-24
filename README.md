@@ -1,10 +1,11 @@
 # router
 
 A bare-minimum Go port of the Python `tor.py` and `warp.py` prototypes. It
-routes traffic through **Cloudflare WARP** (default), **Proton VPN**, or
-**Tor** using a `sing-box` TUN interface or a local mixed proxy.
+routes traffic through **Cloudflare WARP** (default), **Proton VPN**,
+**Proton -> WARP**, or **Tor** using a `sing-box` TUN interface or a local
+mixed proxy.
 
-All three backends are implemented. WARP registration and WireGuard key
+All four backends are implemented. WARP registration and WireGuard key
 generation use only the Go standard library; `warp-cli`, `wgcf`, and
 third-party WARP libraries are not used. The Proton backend consumes only
 Proton's **free** WireGuard servers.
@@ -40,6 +41,9 @@ sudo go run . -b proton -c us/san-jose
 # Free Proton WireGuard, any city in a country
 sudo go run . -b proton -c ca
 
+# Proton city as transport, WARP as the final exit
+sudo go run . -b proton-warp -c ch/zurich
+
 # Whole-system TUN through Tor, random exit country
 sudo go run . -b tor -c random
 
@@ -64,7 +68,8 @@ go build -o router .
 `-b warp` (default) registers an ephemeral Cloudflare WARP device over HTTPS,
 caches it, and configures a sing-box WireGuard endpoint. `-b proton` reads the
 free Proton server list and connects directly to a free Proton WireGuard
-server. `-b tor` starts sing-box's Tor outbound.
+server. `-b proton-warp` uses a free Proton WireGuard server as the outer
+transport and runs WARP inside it. `-b tor` starts sing-box's Tor outbound.
 
 ### WARP accounts
 
@@ -154,6 +159,32 @@ Switching cities restarts the sing-box engine. Proton free servers are shared
 and may be busy; if a server does not complete a handshake, choose another
 city or run the switch again to pick a different server.
 
+### Proton -> WARP
+
+`-b proton-warp` chains two WireGuard endpoints:
+
+```
+you -> free Proton server (outer) -> Cloudflare WARP (inner) -> internet
+```
+
+`-c` selects the **Proton** country or city, using the same `cc` / `cc/city`
+syntax and free-server filtering as the Proton backend. WARP registers a
+normal inner device and connects through the selected Proton server.
+
+Important: the final internet exit is **Cloudflare WARP**, not Proton. The
+Proton city only controls the transport path into Cloudflare. Because Cloudflare
+chooses the WARP edge, the final country is not guaranteed to match the Proton
+city; this is not a way to force WARP into an arbitrary country.
+
+```sh
+sudo ./router -b proton-warp -c ch/zurich
+sudo ./router -b proton-warp -c us/san-jose
+sudo ./router -b proton-warp -c any
+```
+
+The TUI lists Proton countries and cities for this backend too, and restarting
+after a switch regenerates both WireGuard endpoints.
+
 ## Interactive switching
 
 When run in a terminal, the router opens a small Bubble Tea interface. The
@@ -174,7 +205,7 @@ hot-swapping is the next step. Use `--no-interactive` to disable the interface.
 ## Flags
 
 ```
--b, --backend       backend: warp, proton, or tor (default: warp)
+-b, --backend       backend: warp, proton, proton-warp, or tor (default: warp)
 -c, --country       two-letter code, cc/city (Proton), any, or random (default: any)
 --listen-port       local mixed proxy port (default: 10808)
 --proxy-only        force proxy mode even when run as root
@@ -182,7 +213,7 @@ hot-swapping is the next step. Use `--no-interactive` to disable the interface.
 --list              list countries/cities and exit
 --no-verify         skip exit verification
 --no-interactive    disable the interactive country switcher
---interface         TUN interface name (default: sb-warp, sb-proton, or sb-tor)
+--interface         TUN interface name (default: sb-warp, sb-proton, sb-proton-warp, or sb-tor)
 ```
 
 ## Notes
@@ -204,3 +235,5 @@ hot-swapping is the next step. Use `--no-interactive` to disable the interface.
   city.
 - Proton city selection controls the server city. It does not guarantee how
   third-party geolocation databases label the exit IP.
+- `-b proton-warp` uses the Proton city only as transport. Its final exit is
+  Cloudflare WARP, and Cloudflare selects that egress.

@@ -119,6 +119,8 @@ func buildConfig(opts configOptions) singBoxConfig {
 		return buildWarpConfig(opts)
 	case backendProton:
 		return buildProtonConfig(opts)
+	case backendProtonWarp:
+		return buildProtonWarpConfig(opts)
 	default:
 		return buildTorConfig(opts)
 	}
@@ -356,6 +358,109 @@ func buildProtonConfig(opts configOptions) singBoxConfig {
 		{Protocol: "dns", Action: "hijack-dns"},
 		{IPIsPrivate: true, Outbound: "direct"},
 		{Outbound: "proton-out"},
+	}
+
+	return singBoxConfig{
+		Log:       singBoxLog{Level: "info", Timestamp: true, Output: opts.LogPath},
+		DNS:       dns,
+		Inbounds:  inbounds,
+		Endpoints: endpoints,
+		Outbounds: outbounds,
+		Route: singBoxRoute{
+			AutoDetectInterface: true,
+			Rules:               rules,
+		},
+	}
+}
+
+// buildProtonWarpConfig chains a WARP WireGuard endpoint inside a Proton
+// WireGuard endpoint. The Proton server is the transport; the final internet
+// exit is Cloudflare WARP.
+func buildProtonWarpConfig(opts configOptions) singBoxConfig {
+	address := opts.ProtonAddress
+	if address == "" {
+		address = protonDefaultAddress
+	}
+	mtu := opts.ProtonMTU
+	if mtu == 0 {
+		mtu = protonDefaultMTU
+	}
+
+	endpointAddress := opts.ProtonEndpoint
+	publicKey := ""
+	if opts.ProtonServer != nil {
+		publicKey = opts.ProtonServer.WGPubKey
+		if endpointAddress == "" {
+			endpointAddress, _ = opts.ProtonServer.endpoint()
+		}
+	}
+
+	dns := singBoxDNS{
+		Servers: []singBoxDNSServer{{Tag: "dns-remote", Type: "udp", Server: "1.1.1.1"}},
+	}
+
+	inbounds := []singBoxInbound{{
+		Type:       "mixed",
+		Tag:        "mixed-in",
+		Listen:     "127.0.0.1",
+		ListenPort: opts.ListenPort,
+	}}
+	if opts.TUN {
+		inbounds = append([]singBoxInbound{{
+			Type:          "tun",
+			Tag:           "tun-in",
+			InterfaceName: opts.InterfaceName,
+			Address:       []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"},
+			AutoRoute:     true,
+			StrictRoute:   false,
+			Stack:         "mixed",
+		}}, inbounds...)
+	}
+
+	endpoints := []singBoxEndpoint{{
+		Type:       "wireguard",
+		Tag:        "proton-out",
+		PrivateKey: opts.ProtonPrivateKey,
+		Address:    []string{address},
+		MTU:        mtu,
+		Peers: []singBoxPeer{{
+			Address:                     endpointAddress,
+			Port:                        protonEndpointPort,
+			PublicKey:                   publicKey,
+			AllowedIPs:                  []string{"0.0.0.0/0", "::/0"},
+			PersistentKeepaliveInterval: 25,
+		}},
+	}}
+
+	target := "proton-out"
+	if opts.WarpInner != nil && opts.WarpInnerEndpoint != "" {
+		endpoints = append(endpoints, singBoxEndpoint{
+			Type:       "wireguard",
+			Tag:        "warp-inner",
+			Detour:     "proton-out",
+			PrivateKey: warpAccountKey(opts.WarpInner),
+			Address:    warpAddresses(opts.WarpInner),
+			MTU:        warpInnerMTU,
+			Peers: []singBoxPeer{{
+				Address:    opts.WarpInnerEndpoint,
+				Port:       warpEndpointPort,
+				PublicKey:  warpPeerKey(opts.WarpInner),
+				AllowedIPs: []string{"0.0.0.0/0", "::/0"},
+			}},
+		})
+		target = "warp-inner"
+	}
+
+	outbounds := []singBoxOutbound{
+		{Type: "direct", Tag: "direct"},
+		{Type: "block", Tag: "block"},
+	}
+
+	rules := []singBoxRule{
+		{Port: 53, Action: "hijack-dns"},
+		{Protocol: "dns", Action: "hijack-dns"},
+		{IPIsPrivate: true, Outbound: "direct"},
+		{Outbound: target},
 	}
 
 	return singBoxConfig{

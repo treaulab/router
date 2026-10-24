@@ -83,7 +83,7 @@ func run(opts options) error {
 	}
 	// Proton choices need the free server list, which init loads. Other
 	// backends can validate before any network work or service changes.
-	if opts.backend != backendProton {
+	if !isProtonBackend(opts.backend) {
 		country, err := resolveCountryForBackend(opts.backend, opts.country)
 		if err != nil {
 			return err
@@ -98,7 +98,7 @@ func run(opts options) error {
 	}
 	defer a.cleanup()
 
-	if opts.backend == backendProton {
+	if isProtonBackend(opts.backend) {
 		country, err := resolveProtonChoice(opts.country, a.protonServers)
 		if err != nil {
 			return err
@@ -141,8 +141,12 @@ func (a *app) init() error {
 		if err != nil {
 			return fmt.Errorf("initialize WARP: %w", err)
 		}
-	case backendProton:
-		a.configPath = filepath.Join(a.dir, "sing-box-proton.json")
+	case backendProton, backendProtonWarp:
+		name := "sing-box-proton.json"
+		if a.opts.backend == backendProtonWarp {
+			name = "sing-box-proton-warp.json"
+		}
+		a.configPath = filepath.Join(a.dir, name)
 		if err := os.MkdirAll(a.dir, 0o700); err != nil {
 			return fmt.Errorf("create state directory: %w", err)
 		}
@@ -157,6 +161,12 @@ func (a *app) init() error {
 		a.protonServers, err = loadProtonServers(context.Background())
 		if err != nil {
 			return fmt.Errorf("load Proton servers: %w", err)
+		}
+		if a.opts.backend == backendProtonWarp {
+			a.warpInner, err = loadOrRegisterWarpInner(context.Background())
+			if err != nil {
+				return fmt.Errorf("initialize inner WARP: %w", err)
+			}
 		}
 	default:
 		a.configPath = filepath.Join(a.dir, "sing-box-tor.json")
@@ -240,7 +250,7 @@ func (a *app) start() error {
 		} else {
 			a.warpInnerEndpoint = ""
 		}
-	case backendProton:
+	case backendProton, backendProtonWarp:
 		server, err := selectProtonServer(a.protonServers, a.country)
 		if err != nil {
 			return err
@@ -256,6 +266,23 @@ func (a *app) start() error {
 		configOpts.ProtonAddress = a.protonAddress
 		configOpts.ProtonDNS = a.protonDNS
 		configOpts.ProtonMTU = a.protonMTU
+
+		if a.opts.backend == backendProtonWarp {
+			if a.warpInner == nil {
+				inner, err := loadOrRegisterWarpInner(context.Background())
+				if err != nil {
+					return fmt.Errorf("initialize inner WARP: %w", err)
+				}
+				a.warpInner = inner
+			}
+			innerEndpoint, err := warpPeerEndpoint("any", a.warpInner)
+			if err != nil {
+				return err
+			}
+			a.warpInnerEndpoint = innerEndpoint
+			configOpts.WarpInner = a.warpInner
+			configOpts.WarpInnerEndpoint = innerEndpoint
+		}
 	}
 	config := buildConfig(configOpts)
 	if err := writeConfig(a.configPath, config); err != nil {
@@ -359,7 +386,7 @@ func parseCountryChoice(backend, value string) (string, error) {
 }
 
 func (a *app) resolveCountry(value string) (string, error) {
-	if a.opts.backend == backendProton {
+	if isProtonBackend(a.opts.backend) {
 		return resolveProtonChoice(value, a.protonServers)
 	}
 	return resolveCountryForBackend(a.opts.backend, value)
@@ -404,7 +431,7 @@ func (a *app) statusLines() []string {
 		lines = append(lines, "Mode:      Mixed proxy")
 	}
 	lines = append(lines, fmt.Sprintf("Proxy:     http://127.0.0.1:%d  socks5://127.0.0.1:%d", a.opts.listenPort, a.opts.listenPort))
-	if a.opts.backend == backendProton {
+	if isProtonBackend(a.opts.backend) {
 		lines = append(lines, "Country:   "+a.countryLabel(a.country))
 	} else {
 		lines = append(lines, fmt.Sprintf("Country:   %s (%s)", a.countryLabel(a.country), a.country))
@@ -417,11 +444,14 @@ func (a *app) statusLines() []string {
 			lines = append(lines, "Endpoint:  "+a.warpEndpoint)
 		}
 	}
-	if a.opts.backend == backendProton && a.protonServer != nil {
+	if isProtonBackend(a.opts.backend) && a.protonServer != nil {
 		lines = append(lines, "Server:    "+a.protonServer.ServerName)
 		if endpoint, err := a.protonServer.endpoint(); err == nil {
-			lines = append(lines, fmt.Sprintf("Endpoint:  %s:%d", endpoint, protonEndpointPort))
+			lines = append(lines, fmt.Sprintf("Endpoint:  %s:%d (Proton)", endpoint, protonEndpointPort))
 		}
+	}
+	if a.opts.backend == backendProtonWarp && a.warpInnerEndpoint != "" {
+		lines = append(lines, "WARP:      "+a.warpInnerEndpoint+" (inner)")
 	}
 	if a.exitInfo != nil {
 		location := strings.Trim(strings.Join([]string{a.exitInfo.City, a.exitInfo.Country}, ", "), ", ")
@@ -445,6 +475,8 @@ func (a *app) printStatus() {
 		fmt.Fprintln(stdout, "=== WARP Router ===")
 	case backendProton:
 		fmt.Fprintln(stdout, "=== Proton VPN Router ===")
+	case backendProtonWarp:
+		fmt.Fprintln(stdout, "=== Proton -> WARP Router ===")
 	default:
 		fmt.Fprintln(stdout, "=== Tor Router ===")
 	}
